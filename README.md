@@ -215,7 +215,7 @@ DeepSeek-V3.2 关闭深度思考 最大回复长度=10000
 ---
 
 # 【标准输出格式（禁止修改）】
-{
+json{
   "good_sentences": [
     {
       "text": "",
@@ -259,9 +259,430 @@ DeepSeek-V3.2 关闭深度思考 最大回复长度=10000
 |image_url|String|批注后图片的url|
 |debug|String|报错信息|
 
+由于coze环境无法导入PIL等第三方库，因此需要在云服务器构建api，然后通过代码节点调用来进行图像处理，代码节点Python代码：
+```
+import requests
+import json
+import re
+
+async def main(args: Args) -> Output:
+    params = args.params
+    ret: Output = {
+        "image_url": "",
+        "debug": {
+            "received_params": params,
+            "llm_output_type": type(params.get("llm_output")).__name__,
+            "llm_output_raw": params.get("llm_output"),
+            "llm_output_cleaned": None,  # 清洗后的纯JSON字符串
+            "llm_output_parsed": None,
+            "user_image": params.get("user_image"),
+            "error_msg": ""
+        }
+    }
+    
+    try:
+        # ========== 1. 提取并清洗llm_output ==========
+        llm_output = params.get("llm_output", "")
+        ret["debug"]["llm_output_type"] = type(llm_output).__name__
+        ret["debug"]["llm_output_raw"] = llm_output
+        
+        # 仅处理字符串类型的llm_output
+        if isinstance(llm_output, str) and llm_output.strip():
+            # 关键：提取```json和```之间的纯JSON内容
+            json_match = re.search(r"```json\n(.*?)\n```", llm_output, re.DOTALL)
+            if json_match:
+                # 清洗掉代码块标记，得到纯JSON字符串
+                cleaned_json = json_match.group(1).strip()
+                ret["debug"]["llm_output_cleaned"] = cleaned_json
+                # 解析清洗后的JSON
+                llm_output = json.loads(cleaned_json)
+                ret["debug"]["llm_output_parsed"] = llm_output
+            else:
+                ret["debug"]["error_msg"] = "未找到```json包裹的有效JSON内容"
+                return ret
+        else:
+            ret["debug"]["error_msg"] = "llm_output不是非空字符串"
+            return ret
+        
+        # ========== 2. 校验user_image ==========
+        user_image = params.get("user_image", "").strip()
+        ret["debug"]["user_image"] = user_image
+        if not user_image:
+            ret["debug"]["error_msg"] = "user_image为空"
+            return ret
+        
+        # ========== 3. 调用批注API ==========
+        API_URL = "输入你的API"
+        response = requests.post(
+            API_URL,
+            json={"user_image": user_image, "llm_output": llm_output},
+            headers={"Content-Type": "application/json"},
+            timeout=20
+        )
+        
+        # ========== 4. 解析结果 ==========
+        api_result = response.json()
+        ret["image_url"] = api_result.get("image_url", "")
+        ret["debug"]["api_response"] = api_result
+        
+    except json.JSONDecodeError as e:
+        ret["debug"]["error_msg"] = f"JSON解析失败：{str(e)}"
+    except Exception as e:
+        ret["debug"]["error_msg"] = f"整体错误：{str(e)}"
+    
+    return ret
+```
+
+云服务器端api代码：
+```
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import json
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import os
+import random
+import urllib.request
+from io import BytesIO
+
+# ========== API基础配置 ==========
+app = FastAPI()
+# 1. 静态目录（存放批注后的图片，支持公网访问）
+IMAGE_DIR = "/home/admin/annotation_api/static/images"
+os.makedirs(IMAGE_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+# 2. 服务器公网IP（替换为你的实际IP）
+SERVER_IP = "你的实际IP"
+# 3. Linux适配的字体路径（优先思源衬线体，最接近手写）
+LINUX_HANDWRITING_FONT = "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc"
+LINUX_NORMAL_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+
+
+# ========== 数据模型（API请求参数） ==========
+class AnnotationRequest(BaseModel):
+    user_image: str  # 图片URL（核心输入）
+    llm_output: dict  # 大模型批注数据（含grade/feedback/ocr信息）
+
+
+# ========== 核心工具函数 ==========
+def extract_text_height(coord, img_w, img_h):
+    """
+    从大模型输出的coord中提取字高（th），并转换为像素
+    coord格式：[cx, cy, w, h, angle]
+    - angle 85-90°：字高=w（第三个值）
+    - angle 0-5°：字高=h（第四个值）
+    """
+    if len(coord) != 5:
+        return 47  # 默认字高（像素）
+
+    cx_rel, cy_rel, w_rel, h_rel, angle = coord
+    # 提取相对坐标的字高
+    if 85 <= angle <= 90:
+        th_rel = w_rel
+    elif 0 <= angle <= 5:
+        th_rel = h_rel
+    else:
+        th_rel = 55  # 兜底默认值
+
+    # 相对坐标（0-999）转像素坐标
+    th_pix = int(th_rel / 999 * max(img_w, img_h))  # 基于图片最大边转换，保证比例
+    return max(th_pix, 10)  # 最小字高限制，避免过小
+
+
+def get_base_text_height(llm_output, img_w, img_h):
+    """从llm_output中获取基准字高（优先从corrections取，无则用默认）"""
+    # 优先从corrections提取
+    corrections = llm_output.get("corrections", [])
+    if corrections:
+        first_corr = corrections[0]
+        coord = first_corr.get("coord", first_corr.get("rotate_rect", []))
+        if coord:
+            return extract_text_height(coord, img_w, img_h)
+
+    # 其次从good_sentences提取
+    good_sentences = llm_output.get("good_sentences", [])
+    if good_sentences:
+        first_good = good_sentences[0]
+        coord = first_good.get("coord", [])
+        if coord:
+            return extract_text_height(coord, img_w, img_h)
+
+    # 最后从bad_sentences提取
+    bad_sentences = llm_output.get("bad_sentences", [])
+    if bad_sentences:
+        first_bad = bad_sentences[0]
+        coord = first_bad.get("coord", [])
+        if coord:
+            return extract_text_height(coord, img_w, img_h)
+
+    # 兜底默认值
+    return 47
+
+
+def draw_graffiti_wavy_line(img, start_point, end_point, color, thickness=5, amplitude=6, frequency=20):
+    """绘制涂鸦风格波浪线（天蓝色、柔和、稍粗、低密度）"""
+    x1, y1 = start_point
+    x2, y2 = end_point
+    dx = x2 - x1
+    dy = y2 - y1
+    distance = np.hypot(dx, dy)
+
+    points = []
+    for i in np.linspace(0, distance, int(distance / 3)):
+        t = i / distance
+        x = x1 + t * dx
+        y = y1 + t * dy
+        random_offset = random.uniform(-amplitude / 2, amplitude / 2)
+        y += amplitude * np.sin(2 * np.pi * i / frequency) + random_offset
+        points.append((int(round(x)), int(round(y))))
+
+    for i in range(len(points) - 1):
+        cv2.line(img, points[i], points[i + 1], color, thickness, lineType=cv2.LINE_AA)
+
+
+def get_font_path(is_handwriting=True):
+    """获取字体路径（适配Linux服务器，优先手写风格）"""
+    if is_handwriting and os.path.exists(LINUX_HANDWRITING_FONT):
+        return LINUX_HANDWRITING_FONT
+    elif os.path.exists(LINUX_NORMAL_FONT):
+        return LINUX_NORMAL_FONT
+    return None
+
+
+def draw_chinese_text(img, text, pos, font_size_pix, is_handwriting=True, color=(255, 0, 0)):
+    """绘制中文文字（支持手写字体+精准字号）"""
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+
+    font_path = get_font_path(is_handwriting)
+    if font_path:
+        font = ImageFont.truetype(font_path, font_size_pix, encoding="utf-8")
+    else:
+        font = ImageFont.load_default(size=font_size_pix)
+
+    draw.text(pos, text, font=font, fill=color)
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+
+def rel2pix(rel_value, img_size):
+    """相对坐标（0-999）转像素坐标"""
+    return int(rel_value / 999 * img_size)
+
+
+def download_image_from_url(url):
+    """从URL下载图片，返回OpenCV格式"""
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            image_data = resp.read()
+            nparr = np.frombuffer(image_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError("图片解码失败")
+            return img
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"下载图片失败：{str(e)}")
+
+
+def annotate_image(img, llm_output):
+    """主批注函数（按字高自适应调整所有批注尺寸）"""
+    img_h, img_w = img.shape[:2]
+    edge_gap = 5  # 边缘间隙（仅用于与边界的距离，非坐标偏移）
+
+    # ========== 核心：获取基准字高th（像素） ==========
+    th = get_base_text_height(llm_output, img_w, img_h)
+
+    # ========== 计算各批注的自适应尺寸 ==========
+    grade_font_size = 4 * th  # grade尺寸：4*th
+    feedback_font_size = 2 * th  # feedback尺寸：2*th
+    correction_font_size = th  # corrections尺寸：th
+    wave_amplitude = int(0.1 * th)  # good/bad_sentences振幅：0.1*th
+    wave_thickness = max(1, int(0.12 * th))  # 波浪线粗细自适应
+
+    # ------------------- 1. 绘制grade（紧贴右上角） -------------------
+    grade = llm_output.get("grade", "")
+    if grade:
+        text_width = len(grade) * grade_font_size
+        text_height = grade_font_size
+
+        center_x = img_w - (text_width / 2) - edge_gap
+        center_y = (text_height / 2) + edge_gap
+
+        x = int(center_x - (text_width / 2))
+        y = int(center_y - (text_height / 2))
+
+        x = max(x, 0)
+        x = min(x, img_w - text_width)
+        y = max(y, 0)
+        y = min(y, img_h - text_height)
+
+        img = draw_chinese_text(
+            img, grade, (x, y), grade_font_size,
+            is_handwriting=True, color=(255, 0, 0)
+        )
+
+    # ------------------- 2. 绘制feedback（底部居中，2*th） -------------------
+    feedback = llm_output.get("feedback", "")
+    if feedback:
+        text_width = len(feedback) * feedback_font_size
+        text_height = feedback_font_size
+
+        center_x = img_w / 2
+        center_y = img_h - text_height
+
+        x = int(center_x - (text_width / 2))
+        y = int(center_y - (text_height / 2))
+
+        x = max(x, 0)
+        x = min(x, img_w - text_width)
+        y = max(y, 0)
+        y = min(y, img_h - text_height)
+
+        img = draw_chinese_text(
+            img, feedback, (x, y), feedback_font_size,
+            is_handwriting=True, color=(255, 0, 0)
+        )
+
+    # ------------------- 3. 绘制corrections（红框 + 文字在正上方） -------------------
+    corrections = llm_output.get("corrections", [])
+    for corr in corrections:
+        coord = corr.get("coord", corr.get("rotate_rect", []))
+        if len(coord) != 5:
+            continue
+        cx_rel, cy_rel, w_rel, h_rel, angle = coord
+
+        cx = rel2pix(cx_rel, img_w)
+        cy = rel2pix(cy_rel, img_h)
+        w = rel2pix(w_rel, img_w)
+        h = rel2pix(h_rel, img_h)
+
+        # 绘制红色旋转框
+        rot_rect = ((cx, cy), (w, h), angle)
+        box = cv2.boxPoints(rot_rect).astype(np.int32)
+        cv2.drawContours(img, [box], 0, (0, 0, 255), 2, lineType=cv2.LINE_AA)
+
+        # 绘制修正文字：放在红框 正上方 居中
+        correct_text = corr.get("correct", "")
+        if correct_text:
+            # 计算文字宽度，实现居中
+            text_w = len(correct_text) * correction_font_size
+            # 位置：框的正上方，居中
+            text_x = int(cx - text_w / 2)
+            text_y = int(cy - h / 2 - correction_font_size - 4)  # 正上方
+
+            # 边界保护
+            text_x = max(edge_gap, min(text_x, img_w - edge_gap))
+            text_y = max(edge_gap, min(text_y, img_h - edge_gap))
+
+            img = draw_chinese_text(
+                img, correct_text, (text_x, text_y), correction_font_size,
+                is_handwriting=False, color=(255, 0, 0)
+            )
+
+    # ------------------- 4. 绘制good_sentences（天蓝色波浪线） -------------------
+    sky_blue = (235, 206, 135)
+    for sent in llm_output.get("good_sentences", []):
+        coord = sent.get("coord", [])
+        if len(coord) != 5:
+            continue
+        cx_rel, cy_rel, w_rel, h_rel, angle = coord
+
+        cx = rel2pix(cx_rel, img_w)
+        cy = rel2pix(cy_rel, img_h)
+        w = rel2pix(w_rel, img_w)
+        h = rel2pix(h_rel, img_h)
+
+        rot_rect = ((cx, cy), (w, h), angle)
+        box = cv2.boxPoints(rot_rect).astype(np.int32)
+        line_y = box[:, 1].max() + 8
+        line_x_min = box[:, 0].min()
+        line_x_max = box[:, 0].max()
+
+        line_y = max(min(line_y, img_h - edge_gap), edge_gap)
+        line_x_min = max(line_x_min, edge_gap)
+        line_x_max = min(line_x_max, img_w - edge_gap)
+
+        draw_graffiti_wavy_line(
+            img, (line_x_min, line_y), (line_x_max, line_y),
+            color=sky_blue, thickness=wave_thickness, amplitude=wave_amplitude, frequency=22
+        )
+
+    # ------------------- 5. 绘制bad_sentences（黄色波浪线） -------------------
+    yellow = (204, 255, 255)
+    for sent in llm_output.get("bad_sentences", []):
+        coord = sent.get("coord", [])
+        if len(coord) != 5:
+            continue
+        cx_rel, cy_rel, w_rel, h_rel, angle = coord
+
+        cx = rel2pix(cx_rel, img_w)
+        cy = rel2pix(cy_rel, img_h)
+        w = rel2pix(w_rel, img_w)
+        h = rel2pix(h_rel, img_h)
+
+        rot_rect = ((cx, cy), (w, h), angle)
+        box = cv2.boxPoints(rot_rect).astype(np.int32)
+        line_y = box[:, 1].max() + 8
+        line_x_min = box[:, 0].min()
+        line_x_max = box[:, 0].max()
+
+        line_y = max(min(line_y, img_h - edge_gap), edge_gap)
+        line_x_min = max(line_x_min, edge_gap)
+        line_x_max = min(line_x_max, img_w - edge_gap)
+
+        draw_graffiti_wavy_line(
+            img, (line_x_min, line_y), (line_x_max, line_y),
+            color=yellow, thickness=wave_thickness, amplitude=wave_amplitude, frequency=22
+        )
+
+    return img, th  # 返回th值，供外部使用
+
+
+# ========== API接口（核心调用入口） ==========
+@app.post("/annotate_url")
+async def api_annotate_image(req: AnnotationRequest):
+    try:
+        img = download_image_from_url(req.user_image)
+        llm_data = req.llm_output
+        if isinstance(llm_data.get("res_text"), str):
+            llm_data = json.loads(llm_data["res_text"])
+
+        annotated_img, th = annotate_image(img, llm_data)  # 接收返回的th值
+
+        img_name = f"annotated_{random.randint(1000, 9999)}.png"
+        img_path = os.path.join(IMAGE_DIR, img_name)
+        cv2.imwrite(img_path, annotated_img, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+
+        img_url = f"http://{SERVER_IP}:8000/static/images/{img_name}"
+        return {
+            "code": 0,
+            "msg": "批注成功",
+            "image_url": img_url,
+            "base_text_height": th,
+            "details": "自适应字高、粗细、位置已全部生效"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批注失败：{str(e)}")
+
+
+# ========== 启动入口 ==========
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
 ### 5. 节点5：结束
 返回变量：
 |变量名|类型|值|
 |-|-|:-:|
 |output|String|节点4：image_url|
 |name|String|节点1：name|
+
+## 三、运行示例
+示例1原图：
+!(https://github.com/ikun4281/MonkeyC.github.io/blob/main/%E7%A4%BA%E4%BE%8B_%E5%8E%9F%E5%9B%BE/image1.jpg)
+
+示例1标注：
+!(http://47.110.230.76:8000/static/images/annotated_1375.png)
