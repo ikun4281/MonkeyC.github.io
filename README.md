@@ -1,5 +1,8 @@
 # 基于coze搭建的智能体“一图批改“
 ## 运行示例
+智能体界面示例：
+![智能体界面示例](https://github.com/ikun4281/MonkeyC.github.io/blob/main/Pigai.png)
+
 示例1原图：
 ![示例1原图](https://github.com/ikun4281/MonkeyC.github.io/blob/main/%E7%A4%BA%E4%BE%8B_%E5%8E%9F%E5%9B%BE/image1.jpg)
 
