@@ -682,7 +682,7 @@ if __name__ == "__main__":
 
 ## 三、运行示例
 示例1原图：
-!(https://github.com/ikun4281/MonkeyC.github.io/blob/main/%E7%A4%BA%E4%BE%8B_%E5%8E%9F%E5%9B%BE/image1.jpg)
+![示例1原图](https://github.com/ikun4281/MonkeyC.github.io/blob/main/%E7%A4%BA%E4%BE%8B_%E5%8E%9F%E5%9B%BE/image1.jpg)
 
 示例1标注：
-!(http://47.110.230.76:8000/static/images/annotated_1375.png)
+![示例1标注](http://47.110.230.76:8000/static/images/annotated_1375.png)
