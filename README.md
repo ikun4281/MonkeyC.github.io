@@ -78,8 +78,8 @@
 |-|-|:-:|
 |api_key|String|百炼api|
 |image|String|节点1：user_image|
+
 输出（取用部分）：
-输入：
 |变量名|类型|值|
 |-|-|:-:|
 |text|String|OCR识别文本及坐标|
@@ -215,7 +215,6 @@ DeepSeek-V3.2 关闭深度思考 最大回复长度=10000
 ---
 
 # 【标准输出格式（禁止修改）】
-```json
 {
   "good_sentences": [
     {
@@ -240,7 +239,6 @@ DeepSeek-V3.2 关闭深度思考 最大回复长度=10000
   "grade": "",
   "feedback": ""
 }
-```
 ```
 
 #### 输出：
