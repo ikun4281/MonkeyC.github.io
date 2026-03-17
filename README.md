@@ -1,4 +1,12 @@
 # 基于coze搭建的智能体“一图批改“
+## 运行示例
+示例1原图：
+![示例1原图](https://github.com/ikun4281/MonkeyC.github.io/blob/main/%E7%A4%BA%E4%BE%8B_%E5%8E%9F%E5%9B%BE/image1.jpg)
+
+示例1标注：
+![示例1标注](https://github.com/ikun4281/MonkeyC.github.io/blob/main/%E7%A4%BA%E4%BE%8B_%E6%A0%87%E6%B3%A8/image1.png)
+
+更多示例可查看文件夹，使用体验可访问：[点击跳转到Coze链接](https://www.coze.cn/s/_uPTlC1UjJs/)
 
 ## 一、智能体配置
 
@@ -680,9 +688,7 @@ if __name__ == "__main__":
 |output|String|节点4：image_url|
 |name|String|节点1：name|
 
-## 三、运行示例
-示例1原图：
-![示例1原图](https://github.com/ikun4281/MonkeyC.github.io/blob/main/%E7%A4%BA%E4%BE%8B_%E5%8E%9F%E5%9B%BE/image1.jpg)
-
-示例1标注：
-![示例1标注](http://47.110.230.76:8000/static/images/annotated_1375.png)
+## 三、未来展望
+1. 多图批改：设置多图输入、循环OCR识别，串联上下文；
+2. 加强健壮性：对于不同偏转角度的作文进行自适应识别；
+3. ……
