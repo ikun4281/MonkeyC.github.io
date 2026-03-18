@@ -1,4 +1,4 @@
-# 基于coze搭建的智能体“一图批改“
+# 基于coze搭建的智能体“一图批改”
 ## 运行示例
 智能体界面示例：
 ![智能体界面示例](https://github.com/ikun4281/MonkeyC.github.io/blob/main/ui.png)
